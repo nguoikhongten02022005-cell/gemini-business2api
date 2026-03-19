@@ -181,6 +181,10 @@ class RegisterService(BaseTaskService[RegisterTask]):
         proxy_for_auth, _ = parse_proxy_setting(config.basic.proxy_for_auth)
 
         log_cb("info", f"🌐 步骤 2/3: 启动浏览器 (模式={browser_mode}, 无头={headless})...")
+        if proxy_for_auth:
+            log_cb("info", f"🌐 浏览器代理: {proxy_for_auth}")
+        else:
+            log_cb("info", "🌐 浏览器代理: 未启用")
 
         automation = GeminiAutomation(
             user_agent=self.user_agent,
