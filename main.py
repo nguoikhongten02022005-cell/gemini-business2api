@@ -44,12 +44,8 @@ from core.message import (
     build_full_context_text
 )
 from compat.openai_chat import create_chunk, maybe_handle_openai_tool_request
-from compat.openai_responses import (
-    ResponsesRequest,
-    chat_request_from_responses,
-    maybe_handle_responses_request,
-    responses_payload_from_chat_result,
-)
+from compat.openai_responses import ResponsesRequest, ChatRequestCompat
+from responses_runtime import handle_responses_request
 from core.google_api import (
     get_common_headers,
     create_google_session,
@@ -2105,36 +2101,22 @@ async def responses(
     authorization: Optional[str] = Header(None)
 ):
     verify_api_key(API_KEY, authorization)
-
-    response_id = f"resp_{uuid.uuid4().hex}"
-    created_at = int(time.time())
-    chat_req = chat_request_from_responses(req)
-
-    tool_response = maybe_handle_responses_request(
+    return await handle_responses_request(
         req,
-        chat_req=chat_req,
-        response_id=response_id,
-        created_at=created_at,
-    )
-    if tool_response is not None:
-        return tool_response
-
-    request.state.skip_api_service_uptime = True
-    chat_response = await chat_impl(
-        ChatRequest(**chat_req.model_dump()),
         request,
+        lambda chat_req: execute_responses_chat_turn(chat_req, request),
     )
-    return responses_payload_from_chat_result(
-        chat_response,
-        response_id=response_id,
-        requested_model=req.model,
-        created_at=created_at,
-    )
+
+
+async def execute_responses_chat_turn(req: ChatRequestCompat, request: Request) -> Dict[str, Any]:
+    request.state.skip_api_service_uptime = True
+    return await chat_impl(ChatRequest(**req.model_dump()), request, disable_tool_shim=True)
 
 # chat实现函数
 async def chat_impl(
     req: ChatRequest,
     request: Request,
+    disable_tool_shim: bool = False,
 ):
     # 生成请求ID（最优先，用于所有日志追踪）
     request_id = str(uuid.uuid4())[:6]
@@ -2143,9 +2125,10 @@ async def chat_impl(
     request.state.first_response_time = None
     message_count = len(req.messages)
 
-    tool_response = maybe_handle_openai_tool_request(req, str(uuid.uuid4()), int(time.time()))
-    if tool_response is not None:
-        return tool_response
+    if not disable_tool_shim:
+        tool_response = maybe_handle_openai_tool_request(req, str(uuid.uuid4()), int(time.time()))
+        if tool_response is not None:
+            return tool_response
 
     monitor_recorded = False
     account_manager: Optional[AccountManager] = None
@@ -3279,9 +3262,6 @@ async def get_public_logs(request: Request, limit: int = 100):
             "total": len(output_logs),
             "logs": output_logs
         }
-    except Exception as e:
-        logger.error(f"[LOG] 获取公开日志失败: {e}")
-        return {"total": 0, "logs": [], "error": str(e)}
     except Exception as e:
         logger.error(f"[LOG] 获取公开日志失败: {e}")
         return {"total": 0, "logs": [], "error": str(e)}

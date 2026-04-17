@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from fastapi import HTTPException
 from pydantic import BaseModel
 
-from compat.openai_chat import maybe_handle_openai_tool_request
 from compat.tool_calling import message_text
 
 
@@ -32,6 +31,7 @@ class ResponsesRequest(BaseModel):
     top_p: Optional[float] = 1.0
     max_output_tokens: Optional[int] = None
     parallel_tool_calls: Optional[bool] = None
+    previous_response_id: Optional[str] = None
 
 
 class ChatMessage(BaseModel):
@@ -121,13 +121,23 @@ def validate_responses_request(req: ResponsesRequest) -> None:
     if req.tool_choice not in (None, "auto", "required", "none") and not isinstance(req.tool_choice, dict):
         build_error_payload("Unsupported tool_choice value", "invalid_request_error", 400)
 
+    if req.previous_response_id is not None:
+        if not isinstance(req.previous_response_id, str) or not req.previous_response_id.strip():
+            build_error_payload("previous_response_id must be a non-empty string", "invalid_request_error", 400)
+
     if req.tools:
-        for tool in req.tools:
+        for index, tool in enumerate(req.tools):
             if tool.get("type") != "function":
                 build_error_payload("Only function tools are supported", "invalid_request_error", 400)
-            parameters = (tool.get("function") or {}).get("parameters")
+            function = tool.get("function") or {}
+            name = function.get("name")
+            if not isinstance(name, str) or not name.strip():
+                build_error_payload(f"tools[{index}].function.name is required", "invalid_request_error", 400)
+            parameters = function.get("parameters")
             if parameters is not None and not isinstance(parameters, dict):
                 build_error_payload("Tool parameters must be a JSON schema object", "invalid_request_error", 400)
+            if parameters is not None and parameters.get("type") not in (None, "object"):
+                build_error_payload("Tool parameters.type must be 'object' when provided", "invalid_request_error", 400)
 
 
 def normalize_responses_input(input_value: Union[str, List[Dict[str, Any]], List[ResponsesInputItem]], instructions: Optional[str]) -> List[ChatMessage]:
@@ -230,17 +240,14 @@ def responses_payload_from_chat_result(chat_result: Dict[str, Any], response_id:
     return build_responses_payload(response_id, resolved_model, resolved_created_at, output, output_text)
 
 
-def maybe_handle_responses_request(
+def response_payload_from_output_items(
     req: ResponsesRequest,
-    chat_req: Optional[ChatRequestCompat] = None,
-    response_id: Optional[str] = None,
-    created_at: Optional[int] = None,
-):
-    chat_req = chat_req or chat_request_from_responses(req)
-    response_id = response_id or f"resp_{uuid.uuid4().hex}"
-    created_at = created_at or int(time.time())
-    chat_id = f"chatcmpl-{uuid.uuid4()}"
-    chat_result = maybe_handle_openai_tool_request(chat_req, chat_id, created_at)
-    if chat_result is None:
-        return None
-    return responses_payload_from_chat_result(chat_result, response_id, requested_model=req.model, created_at=created_at)
+    response_id: str,
+    created_at: int,
+    output: List[Dict[str, Any]],
+    status: str,
+    output_text: str = "",
+) -> Dict[str, Any]:
+    payload = build_responses_payload(response_id, req.model, created_at, output, output_text, status=status)
+    payload["previous_response_id"] = req.previous_response_id
+    return payload

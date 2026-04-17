@@ -214,17 +214,71 @@ The script auto-detects the environment (PostgreSQL / SQLite) and renames old fi
 
 ## 📡 API Endpoints
 
-This project exposes an OpenAI-compatible gateway. `/v1/chat/completions` is the primary compatibility route, and `/v1/responses` is an experimental minimal subset rather than a full Responses API implementation.
+This project exposes an OpenAI-compatible gateway. `/v1/chat/completions` remains the primary backward-compatible route, while `/v1/responses` is now a practical stateful backend for coding-agent workflows. It is still not a full official Responses API parity claim.
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/v1/chat/completions` | POST | Chat completions (streaming supported) |
+| `/v1/responses` | POST | Stateful coding-agent backend with multi-step continuation |
 | `/v1/models` | GET | List available models |
 | `/v1/images/generations` | POST | Image generation (text-to-image) |
 | `/v1/images/edits` | POST | Image editing (image-to-image) |
 | `/health` | GET | Health check |
 
-**Example:**
+### Compatibility matrix
+
+#### `/v1/chat/completions`
+
+**Supported**
+- Basic chat requests
+- `stream=true`
+- `tools` with `type=function`
+- heuristic tool shim for coding/file/search cases
+- backward-compatible tool-result finalization on the legacy route
+
+**Limitations**
+- not a full OpenAI Chat Completions replica
+- `parallel_tool_calls` is not truly supported
+- non-function tools are rejected
+
+#### `/v1/responses`
+
+**Supported now**
+- string `input`
+- array `input` with text `user` / `assistant` / `system` / `developer`
+- `developer -> system`
+- `instructions`
+- `tools` with `type=function`
+- `tool_choice`
+- `temperature` / `top_p`
+- `previous_response_id`
+- `function_call_output` continuation
+- sequential multi-step tool lifecycle across multiple responses
+- stable output items: `message`, `function_call`, `function_call_output`
+- `stream=false` stable JSON
+- `stream=true` practical SSE events:
+  - `response.created`
+  - `response.output_item.added`
+  - `response.output_text.delta`
+  - `response.function_call_arguments.delta`
+  - `response.output_item.done`
+  - `response.completed`
+  - `response.failed`
+
+**Experimental / partial**
+- planner/tool selection behavior still reuses current heuristic/backend behavior in some paths
+- not the full OpenAI Responses item taxonomy
+- `metadata` is persisted but does not yet affect execution behavior
+- `max_output_tokens` is accepted but not mapped precisely to upstream token semantics
+
+**Not supported**
+- `parallel_tool_calls=true` -> explicit `501`
+- non-function tools -> explicit `400`
+- non-text input item types -> explicit `400`
+
+### Examples
+
+#### Chat completions
 
 ```bash
 curl http://localhost:7860/v1/chat/completions \
@@ -234,6 +288,64 @@ curl http://localhost:7860/v1/chat/completions \
     "model": "gemini-2.5-flash",
     "messages": [{"role": "user", "content": "Hello"}],
     "stream": true
+  }'
+```
+
+#### Responses non-stream
+
+```bash
+curl http://localhost:7860/v1/responses \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-auto",
+    "input": "Hello"
+  }'
+```
+
+#### Responses stream
+
+```bash
+curl -N http://localhost:7860/v1/responses \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-auto",
+    "stream": true,
+    "input": "Summarize this repository"
+  }'
+```
+
+#### Responses continuation with `previous_response_id`
+
+```bash
+curl http://localhost:7860/v1/responses \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-auto",
+    "previous_response_id": "resp_previous_id",
+    "input": [
+      {
+        "type": "function_call_output",
+        "call_id": "call_123",
+        "output": "1 | #!/usr/bin/env python3"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "Read a file",
+          "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+          }
+        }
+      }
+    ]
   }'
 ```
 

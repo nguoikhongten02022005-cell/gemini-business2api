@@ -1,0 +1,10 @@
+{
+  "servers": [
+    {
+      "name": "example-stdio-server",
+      "transport": "stdio",
+      "command": ["python3", "-m", "example_mcp_server"],
+      "experimental": true
+    }
+  ]
+}

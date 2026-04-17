@@ -313,6 +313,73 @@ async def _init_tables(pool) -> None:
             ON task_history(created_at DESC)
             """
         )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS responses (
+                id TEXT PRIMARY KEY,
+                previous_response_id TEXT,
+                conversation_key TEXT NOT NULL,
+                model TEXT NOT NULL,
+                status TEXT NOT NULL,
+                request_config_json JSONB,
+                metadata_json JSONB,
+                usage_json JSONB,
+                error_json JSONB,
+                step_count INTEGER NOT NULL DEFAULT 1,
+                created_at DOUBLE PRECISION NOT NULL,
+                updated_at DOUBLE PRECISION NOT NULL
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS responses_previous_response_idx
+            ON responses(previous_response_id)
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS responses_conversation_key_idx
+            ON responses(conversation_key)
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS responses_created_at_idx
+            ON responses(created_at DESC)
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS response_items (
+                response_id TEXT NOT NULL,
+                item_index INTEGER NOT NULL,
+                direction TEXT NOT NULL,
+                item_type TEXT NOT NULL,
+                role TEXT,
+                call_id TEXT,
+                name TEXT,
+                arguments_json JSONB,
+                content_json JSONB,
+                text TEXT,
+                status TEXT,
+                created_at DOUBLE PRECISION NOT NULL,
+                PRIMARY KEY (response_id, item_index)
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS response_items_response_id_idx
+            ON response_items(response_id, item_index)
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS response_items_call_id_idx
+            ON response_items(call_id)
+            """
+        )
         logger.info("[STORAGE] Database tables initialized")
 
 def _init_sqlite_tables(conn: sqlite3.Connection) -> None:
@@ -365,6 +432,73 @@ def _init_sqlite_tables(conn: sqlite3.Connection) -> None:
             """
             CREATE INDEX IF NOT EXISTS task_history_created_at_idx
             ON task_history(created_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS responses (
+                id TEXT PRIMARY KEY,
+                previous_response_id TEXT,
+                conversation_key TEXT NOT NULL,
+                model TEXT NOT NULL,
+                status TEXT NOT NULL,
+                request_config_json TEXT,
+                metadata_json TEXT,
+                usage_json TEXT,
+                error_json TEXT,
+                step_count INTEGER NOT NULL DEFAULT 1,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS responses_previous_response_idx
+            ON responses(previous_response_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS responses_conversation_key_idx
+            ON responses(conversation_key)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS responses_created_at_idx
+            ON responses(created_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS response_items (
+                response_id TEXT NOT NULL,
+                item_index INTEGER NOT NULL,
+                direction TEXT NOT NULL,
+                item_type TEXT NOT NULL,
+                role TEXT,
+                call_id TEXT,
+                name TEXT,
+                arguments_json TEXT,
+                content_json TEXT,
+                text TEXT,
+                status TEXT,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (response_id, item_index)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS response_items_response_id_idx
+            ON response_items(response_id, item_index)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS response_items_call_id_idx
+            ON response_items(call_id)
             """
         )
         conn.execute(
@@ -1143,3 +1277,343 @@ def load_task_history_sync(limit: int = 100) -> Optional[list]:
 
 def clear_task_history_sync() -> int:
     return _run_in_db_loop(clear_task_history())
+
+
+# ==================== Responses storage ====================
+
+def _json_payload(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _json_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return value
+    return value
+
+
+async def save_response_record(record: dict) -> bool:
+    if not is_database_enabled():
+        return False
+    response_id = record.get("id")
+    if not response_id:
+        return False
+    payloads = {
+        "request_config_json": _json_payload(record.get("request_config_json")),
+        "metadata_json": _json_payload(record.get("metadata_json")),
+        "usage_json": _json_payload(record.get("usage_json")),
+        "error_json": _json_payload(record.get("error_json")),
+    }
+    backend = _get_backend()
+    try:
+        if backend == "postgres":
+            async with _pg_acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO responses (
+                        id,
+                        previous_response_id,
+                        conversation_key,
+                        model,
+                        status,
+                        request_config_json,
+                        metadata_json,
+                        usage_json,
+                        error_json,
+                        step_count,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                    ON CONFLICT (id) DO UPDATE SET
+                        previous_response_id = EXCLUDED.previous_response_id,
+                        conversation_key = EXCLUDED.conversation_key,
+                        model = EXCLUDED.model,
+                        status = EXCLUDED.status,
+                        request_config_json = EXCLUDED.request_config_json,
+                        metadata_json = EXCLUDED.metadata_json,
+                        usage_json = EXCLUDED.usage_json,
+                        error_json = EXCLUDED.error_json,
+                        step_count = EXCLUDED.step_count,
+                        created_at = EXCLUDED.created_at,
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    response_id,
+                    record.get("previous_response_id"),
+                    record.get("conversation_key") or response_id,
+                    record.get("model") or "unknown",
+                    record.get("status") or "in_progress",
+                    payloads["request_config_json"],
+                    payloads["metadata_json"],
+                    payloads["usage_json"],
+                    payloads["error_json"],
+                    int(record.get("step_count", 1)),
+                    float(record.get("created_at", time.time())),
+                    float(record.get("updated_at", time.time())),
+                )
+            return True
+        if backend == "sqlite":
+            conn = _get_sqlite_conn()
+            with _sqlite_lock, conn:
+                conn.execute(
+                    """
+                    INSERT INTO responses (
+                        id,
+                        previous_response_id,
+                        conversation_key,
+                        model,
+                        status,
+                        request_config_json,
+                        metadata_json,
+                        usage_json,
+                        error_json,
+                        step_count,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        previous_response_id = excluded.previous_response_id,
+                        conversation_key = excluded.conversation_key,
+                        model = excluded.model,
+                        status = excluded.status,
+                        request_config_json = excluded.request_config_json,
+                        metadata_json = excluded.metadata_json,
+                        usage_json = excluded.usage_json,
+                        error_json = excluded.error_json,
+                        step_count = excluded.step_count,
+                        created_at = excluded.created_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        response_id,
+                        record.get("previous_response_id"),
+                        record.get("conversation_key") or response_id,
+                        record.get("model") or "unknown",
+                        record.get("status") or "in_progress",
+                        payloads["request_config_json"],
+                        payloads["metadata_json"],
+                        payloads["usage_json"],
+                        payloads["error_json"],
+                        int(record.get("step_count", 1)),
+                        float(record.get("created_at", time.time())),
+                        float(record.get("updated_at", time.time())),
+                    ),
+                )
+            return True
+    except Exception as e:
+        logger.error(f"[STORAGE] Response write failed: {e}")
+    return False
+
+
+async def replace_response_items(response_id: str, items: list[dict]) -> bool:
+    if not is_database_enabled():
+        return False
+    backend = _get_backend()
+    now = time.time()
+    try:
+        if backend == "postgres":
+            async with _pg_acquire() as conn:
+                async with conn.transaction():
+                    await conn.execute("DELETE FROM response_items WHERE response_id = $1", response_id)
+                    for index, item in enumerate(items):
+                        await conn.execute(
+                            """
+                            INSERT INTO response_items (
+                                response_id,
+                                item_index,
+                                direction,
+                                item_type,
+                                role,
+                                call_id,
+                                name,
+                                arguments_json,
+                                content_json,
+                                text,
+                                status,
+                                created_at
+                            )
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                            """,
+                            response_id,
+                            index,
+                            item.get("direction") or "output",
+                            item.get("item_type") or item.get("type") or "message",
+                            item.get("role"),
+                            item.get("call_id"),
+                            item.get("name"),
+                            _json_payload(item.get("arguments")),
+                            _json_payload(item.get("content")),
+                            item.get("text"),
+                            item.get("status"),
+                            float(item.get("created_at", now)),
+                        )
+            return True
+        if backend == "sqlite":
+            conn = _get_sqlite_conn()
+            with _sqlite_lock, conn:
+                conn.execute("DELETE FROM response_items WHERE response_id = ?", (response_id,))
+                for index, item in enumerate(items):
+                    conn.execute(
+                        """
+                        INSERT INTO response_items (
+                            response_id,
+                            item_index,
+                            direction,
+                            item_type,
+                            role,
+                            call_id,
+                            name,
+                            arguments_json,
+                            content_json,
+                            text,
+                            status,
+                            created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            response_id,
+                            index,
+                            item.get("direction") or "output",
+                            item.get("item_type") or item.get("type") or "message",
+                            item.get("role"),
+                            item.get("call_id"),
+                            item.get("name"),
+                            _json_payload(item.get("arguments")),
+                            _json_payload(item.get("content")),
+                            item.get("text"),
+                            item.get("status"),
+                            float(item.get("created_at", now)),
+                        ),
+                    )
+            return True
+    except Exception as e:
+        logger.error(f"[STORAGE] Response items write failed: {e}")
+    return False
+
+
+async def load_response_record(response_id: str) -> Optional[dict]:
+    if not is_database_enabled() or not response_id:
+        return None
+    backend = _get_backend()
+    try:
+        if backend == "postgres":
+            async with _pg_acquire() as conn:
+                row = await conn.fetchrow("SELECT * FROM responses WHERE id = $1", response_id)
+            if not row:
+                return None
+            return {
+                "id": row["id"],
+                "previous_response_id": row["previous_response_id"],
+                "conversation_key": row["conversation_key"],
+                "model": row["model"],
+                "status": row["status"],
+                "request_config_json": _json_value(row["request_config_json"]),
+                "metadata_json": _json_value(row["metadata_json"]),
+                "usage_json": _json_value(row["usage_json"]),
+                "error_json": _json_value(row["error_json"]),
+                "step_count": row["step_count"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+        if backend == "sqlite":
+            conn = _get_sqlite_conn()
+            with _sqlite_lock:
+                row = conn.execute("SELECT * FROM responses WHERE id = ?", (response_id,)).fetchone()
+            if not row:
+                return None
+            return {
+                "id": row["id"],
+                "previous_response_id": row["previous_response_id"],
+                "conversation_key": row["conversation_key"],
+                "model": row["model"],
+                "status": row["status"],
+                "request_config_json": _json_value(row["request_config_json"]),
+                "metadata_json": _json_value(row["metadata_json"]),
+                "usage_json": _json_value(row["usage_json"]),
+                "error_json": _json_value(row["error_json"]),
+                "step_count": row["step_count"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+    except Exception as e:
+        logger.error(f"[STORAGE] Response read failed: {e}")
+    return None
+
+
+async def load_response_items(response_id: str) -> Optional[list[dict]]:
+    if not is_database_enabled() or not response_id:
+        return None
+    backend = _get_backend()
+    try:
+        if backend == "postgres":
+            async with _pg_acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT * FROM response_items WHERE response_id = $1 ORDER BY item_index ASC",
+                    response_id,
+                )
+        elif backend == "sqlite":
+            conn = _get_sqlite_conn()
+            with _sqlite_lock:
+                rows = conn.execute(
+                    "SELECT * FROM response_items WHERE response_id = ? ORDER BY item_index ASC",
+                    (response_id,),
+                ).fetchall()
+        else:
+            return None
+        results = []
+        for row in rows:
+            results.append({
+                "response_id": row["response_id"],
+                "item_index": row["item_index"],
+                "direction": row["direction"],
+                "item_type": row["item_type"],
+                "role": row["role"],
+                "call_id": row["call_id"],
+                "name": row["name"],
+                "arguments": _json_value(row["arguments_json"]),
+                "content": _json_value(row["content_json"]),
+                "text": row["text"],
+                "status": row["status"],
+                "created_at": row["created_at"],
+            })
+        return results
+    except Exception as e:
+        logger.error(f"[STORAGE] Response items read failed: {e}")
+    return None
+
+
+async def load_response_chain_items(response_id: str) -> Optional[list[dict]]:
+    if not is_database_enabled() or not response_id:
+        return None
+    record = await load_response_record(response_id)
+    if record is None:
+        return None
+    return await load_response_items(response_id)
+
+
+def save_response_record_sync(record: dict) -> bool:
+    return _run_in_db_loop(save_response_record(record))
+
+
+def replace_response_items_sync(response_id: str, items: list[dict]) -> bool:
+    return _run_in_db_loop(replace_response_items(response_id, items))
+
+
+def load_response_record_sync(response_id: str) -> Optional[dict]:
+    return _run_in_db_loop(load_response_record(response_id))
+
+
+def load_response_items_sync(response_id: str) -> Optional[list[dict]]:
+    return _run_in_db_loop(load_response_items(response_id))
+
+
+def load_response_chain_items_sync(response_id: str) -> Optional[list[dict]]:
+    return _run_in_db_loop(load_response_chain_items(response_id))

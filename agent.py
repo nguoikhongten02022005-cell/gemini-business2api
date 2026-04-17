@@ -778,7 +778,21 @@ def main() -> None:
                 messages.pop()
 
 
+def run_responses_cli(task: str | None = None) -> int:
+    try:
+        from cli.agent import main as cli_main
+    except Exception:
+        return 1
+    argv = []
+    if task:
+        argv.append(task)
+    return cli_main(argv)
+
+
 if __name__ == "__main__":
+    if os.getenv("AGENT_USE_RESPONSES_CLI") == "1":
+        task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else None
+        raise SystemExit(run_responses_cli(task))
     if len(sys.argv) > 1:
         task = " ".join(sys.argv[1:])
         messages = build_cli_messages(task)

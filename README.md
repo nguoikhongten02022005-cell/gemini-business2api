@@ -225,8 +225,8 @@ python scripts/migrate_to_database.py
 
 ## 📡 API 接口
 
-项目继续保留现有 `/v1/chat/completions`，并新增一个面向 coding agents 的 **minimal `/v1/responses` subset**。
-目标是做一个对 tool-calling 工作流更友好、更可调试的后端，而不是宣称完整复刻所有 OpenAI / Claude Code 行为。
+项目继续保留现有 `/v1/chat/completions`，并将 `/v1/responses` 提升为面向 coding agents 的 **stateful practical agent backend**。
+目标是做一个对 tool-calling、多步 continuation、stream events 更友好、更可调试的后端，而不是宣称完整复刻所有 OpenAI / Claude Code 行为。
 
 | 接口                     | 方法 | 说明                                      |
 | ------------------------ | ---- | ----------------------------------------- |
@@ -259,44 +259,57 @@ python scripts/migrate_to_database.py
 
 #### `/v1/responses`
 
-**Supported**
+**Supported now**
 - `model`
-- `input` 为字符串（plain text / no-tools）
+- `input` 为字符串
 - `input` 为数组，支持文本型 `user` / `assistant` / `system` / `developer`
 - `developer` 会映射到内部 `system`
+- `instructions`
 - `tools`（仅 `type=function`）
 - `tool_choice`
-- `instructions`
 - `temperature` / `top_p`
-- `function_call_output` 回传后的最小兼容收敛（当前由本地 heuristic finalization 处理简单文本场景）
-- plain no-tool 请求会走内部 chat backend，再转换成最小稳定 Responses 对象
-- 返回最小稳定格式：`id` / `object` / `created_at` / `model` / `status` / `output` / `output_text`
+- `previous_response_id`
+- `function_call_output` continuation
+- 多步 sequential tool lifecycle（跨多个 response）
+- 稳定输出 item taxonomy：`message` / `function_call` / `function_call_output`
+- `stream=false` 返回稳定 JSON
+- `stream=true` 返回 practical SSE events：
+  - `response.created`
+  - `response.output_item.added`
+  - `response.output_text.delta`
+  - `response.function_call_arguments.delta`
+  - `response.output_item.done`
+  - `response.completed`
+  - `response.failed`
+- response graph / state store（SQLite / PostgreSQL）
 
-**Not supported / experimental**
+**Experimental / partial**
+- tool call planning 仍优先复用现有 heuristic shim / current backend behavior，而不是完整官方 Responses planner parity
+- 返回的是稳定实用子集，不是完整 OpenAI Responses item taxonomy
+- `metadata` 当前会被持久化，但尚未影响执行逻辑
+- `max_output_tokens` 当前仅接收，未精确映射到上游 quota/token 语义
+
+**Not supported**
 - `parallel_tool_calls=true` -> 明确返回 `501`
 - 非 function tools -> 明确返回 `400`
-- 仅支持文本型 input items；其他 item types 目前明确返回 `400`
-- 完整 Responses API item taxonomy 未全部实现
-- `stream` 字段当前仅接收；返回仍是稳定的非流式 JSON，不输出完整 Responses streaming event 格式
-- `metadata` 当前安全忽略
-- `max_output_tokens` 当前仅接收，未精确映射到上游 quota/token 语义
+- 非文本型 input items -> 明确返回 `400`
 
 ### Tool-calling lifecycle
 
 推荐按以下生命周期使用：
 
-1. 客户端请求模型并附带 `tools`
-2. 服务端根据 schema + 明确信号决定是否返回 tool call
+1. 客户端请求 `/v1/responses` 并附带 `tools`
+2. 服务端返回 `function_call`
 3. 客户端执行工具
-4. 客户端将 tool output / `function_call_output` 传回服务端
-5. 服务端对简单 tool result 场景做本地 heuristic finalization，生成最终回答；并非完整的多步模型 continuation
+4. 客户端将 `function_call_output` + `previous_response_id` 传回服务端
+5. 服务端继续下一轮 model turn
+6. 可能再次返回 `function_call`，或返回最终 `message`
 
 当前实现原则：
-- 优先 schema-driven，而不是盲猜
-- 对 path hint 做安全约束
-- 找不到安全 path hint 时，不乱造文件工具调用
-- 参数不满足 schema 时，不静默吞掉
+- continuation 依赖 persisted response graph，而不是要求客户端重复发送全部历史
+- tool outputs 会被当作真正 continuation step，而不是主路径上的本地 heuristic finalization
 - `parallel_tool_calls` 尚未支持时明确报错，不假装成功
+- unsupported item/tool/schema 明确返回 `400/501`
 
 ### Heuristic tool shim
 
@@ -425,9 +438,20 @@ curl http://localhost:7860/v1/responses \
   }'
 ```
 
-说明：`input` 是纯文本时当前会走内部 chat backend，再包装成 Responses 最小子集返回；即使传 `"stream": true`，当前也仍返回稳定的非流式 JSON。
+#### 5) responses stream events
 
-#### 5) responses with tools
+```bash
+curl -N http://localhost:7860/v1/responses \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-auto",
+    "stream": true,
+    "input": "Summarize this repository"
+  }'
+```
+
+#### 6) responses with tools
 
 ```bash
 curl http://localhost:7860/v1/responses \
@@ -456,7 +480,9 @@ curl http://localhost:7860/v1/responses \
   }'
 ```
 
-#### 6) gửi `function_call_output` quay lại responses
+响应会先返回 `function_call` item 和新的 `response.id`。
+
+#### 7) gửi `function_call_output` + `previous_response_id` quay lại responses
 
 ```bash
 curl http://localhost:7860/v1/responses \
@@ -464,13 +490,8 @@ curl http://localhost:7860/v1/responses \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gemini-auto",
+    "previous_response_id": "resp_previous_id",
     "input": [
-      {
-        "role": "user",
-        "content": [
-          {"type": "input_text", "text": "What is the first line?"}
-        ]
-      },
       {
         "type": "function_call_output",
         "call_id": "call_123",
@@ -494,6 +515,46 @@ curl http://localhost:7860/v1/responses \
       }
     ]
   }'
+```
+
+#### 8) Python OpenAI SDK example for `/v1/responses`
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:7860/v1", api_key="your-api-key")
+
+first = client.responses.create(
+    model="gemini-auto",
+    input="Read `agent.py`",
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a file",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    }],
+)
+
+call = first.output[0]
+second = client.responses.create(
+    model="gemini-auto",
+    previous_response_id=first.id,
+    input=[{
+        "type": "function_call_output",
+        "call_id": call.call_id,
+        "output": "1 | #!/usr/bin/env python3",
+    }],
+    tools=first.model_extra.get("tools") if getattr(first, "model_extra", None) else None,
+)
+
+print(second.output_text)
 ```
 
 ### Python example with OpenAI SDK
@@ -534,20 +595,21 @@ print(response)
 
 ### Experimental notes
 
-以下能力目前应视为 **experimental**：
-- `/v1/responses`（整体仍是 minimal subset）
-- 启发式 tool-calling shim
+以下能力目前应视为 **experimental / partial**：
+- `/v1/responses` 的 planner / tool selection 仍主要复用现有 heuristic / backend behavior，而不是完整官方 planner parity
+- 启发式 tool-calling shim（尤其 `/v1/chat/completions` 路径）
 - coding-agent oriented 的 schema fallback
 - 与特定第三方 agent / SDK 的边缘兼容行为
+- CLI / MCP / hooks / subagents（见下文）
 
 如果某类请求当前无法被干净支持，服务会优先返回明确的 `400` / `501`，而不是静默伪造兼容行为。
 
-Nếu bạn cần “backend tốt cho coding agents”, hãy ưu tiên dựa trên các hành vi đã liệt kê ở đây thay vì giả định toàn bộ OpenAI Responses API đều đã có.
+Nếu bạn cần “backend tốt cho coding agents”, hãy dựa trên compatibility matrix và examples ở đây, không giả định full official OpenAI / Claude Code parity.
 
-### agent.py
+### CLI agents
 
-`agent.py` 目前 vẫn dùng được với `/v1/chat/completions` như cũ.
-Nếu muốn thử `/v1/responses` cho workflow riêng, nên giữ `/v1/chat/completions` làm fallback ở client layer thay vì bỏ hẳn route cũ.
+- `agent.py` 目前仍可继续走 `/v1/chat/completions` 兼容路径。
+- 新的 `python -m cli.agent` 会优先走 `/v1/responses`，并保留 fallback `/v1/chat/completions`。
 
 Ví dụ chạy agent hiện tại:
 

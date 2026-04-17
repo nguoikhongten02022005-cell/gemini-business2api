@@ -1,0 +1,1 @@
+"""Experimental MCP integration scaffold."""
