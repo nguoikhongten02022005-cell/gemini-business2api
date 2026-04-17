@@ -606,6 +606,42 @@ print(response)
 
 Nếu bạn cần “backend tốt cho coding agents”, hãy dựa trên compatibility matrix và examples ở đây, không giả định full official OpenAI / Claude Code parity.
 
+## Known Limitations
+
+- `/v1/responses` 目前是 **practical stable subset**，不是完整官方 OpenAI Responses parity。
+- planner / tool selection 在部分路径上仍然 partly heuristic，尤其仍会复用现有 shim / backend behavior。
+- `parallel_tool_calls=true` 尚未支持，会明确返回 `501`。
+- item taxonomy 与 streaming event schema 是稳定实用子集，不是 1:1 official clone。
+- `python -m cli.agent` 是本地 practical coding agent，不是 official Codex / Claude Code parity。
+- MCP / hooks / subagents 目前是 experimental 或 scaffold-only，不应当被视为完整功能。
+
+## CLI Approval Modes
+
+`python -m cli.agent` 目前支持 3 种 mode：
+
+- `read-only`
+  - 允许：读取文件、列目录、搜索、`git status` / `git diff`
+  - 阻止：写文件、编辑文件、`run_command`、`format`
+  - 适合：只读审查、理解仓库、生成总结
+- `ask-for-approval`
+  - 只读工具默认直接执行
+  - mutating tools / commands 会在本地 prompt 确认
+  - 适合：半自动修复或需要人工把关的变更
+- `full-auto`
+  - 不再逐次询问
+  - 仍保留 workspace path guardrails 与 command allowlist
+  - 适合：你已经信任当前任务范围时使用
+
+示例：
+
+```bash
+python -m cli.agent --mode read-only "summarize this repo"
+python -m cli.agent --mode ask-for-approval "fix failing tests"
+python -m cli.agent --mode full-auto "run lint and fix simple formatting issues"
+```
+
+CLI transcript 会保存在：`data/agent_runs/<run_id>.json`
+
 ### CLI agents
 
 - `agent.py` 目前仍可继续走 `/v1/chat/completions` 兼容路径。
