@@ -225,17 +225,101 @@ python scripts/migrate_to_database.py
 
 ## 📡 API 接口
 
-完全兼容 OpenAI API 格式，可直接对接 ChatGPT-Next-Web、LobeChat、OpenCat 等客户端。
+项目继续保留现有 `/v1/chat/completions`，并新增一个面向 coding agents 的 **minimal `/v1/responses` subset**。
+目标是做一个对 tool-calling 工作流更友好、更可调试的后端，而不是宣称完整复刻所有 OpenAI / Claude Code 行为。
 
-| 接口                     | 方法 | 说明                 |
-| ------------------------ | ---- | -------------------- |
-| `/v1/chat/completions`   | POST | 对话补全（支持流式） |
-| `/v1/models`             | GET  | 获取可用模型列表     |
-| `/v1/images/generations` | POST | 图片生成（文生图）   |
-| `/v1/images/edits`       | POST | 图片编辑（图生图）   |
-| `/health`                | GET  | 健康检查             |
+| 接口                     | 方法 | 说明                                      |
+| ------------------------ | ---- | ----------------------------------------- |
+| `/v1/chat/completions`   | POST | 对话补全（保留兼容，支持流式）            |
+| `/v1/responses`          | POST | 面向 agent / tool workflow 的最小兼容子集 |
+| `/v1/models`             | GET  | 获取可用模型列表                          |
+| `/v1/images/generations` | POST | 图片生成（文生图）                        |
+| `/v1/images/edits`       | POST | 图片编辑（图生图）                        |
+| `/health`                | GET  | 健康检查                                  |
 
-**调用示例：**
+> `API_KEY` 在管理面板 → 系统设置中配置，留空则公开访问，支持多个 Key 逗号分隔。
+
+### Compatibility matrix
+
+#### `/v1/chat/completions`
+
+**Supported**
+- 基本聊天请求
+- `stream=true`
+- `tools`（`type=function`）
+- `tool_choice=auto|none|required`（最小兼容处理）
+- tool result 回传后的下一轮收敛
+- 启发式 tool-calling shim（更偏向 coding/file/search 场景）
+
+**Not fully supported / limitations**
+- 不是完整 OpenAI Chat Completions 行为复刻
+- `parallel_tool_calls` 目前不真正支持并行执行
+- 非 function 类型 tools 不支持
+- 当无法安全推断工具调用时，会返回普通回答或进入正常网关流程，不会硬造 tool call
+
+#### `/v1/responses`
+
+**Supported**
+- `model`
+- `input` 为字符串
+- `input` 为数组，支持 `user` / `assistant` / `system` / `developer`
+- `developer` 会映射到内部 `system`
+- `tools`（仅 `type=function`）
+- `tool_choice`
+- `instructions`
+- `temperature` / `top_p`
+- `stream` 字段可接收
+- `function_call_output` 回传并继续下一轮
+- 返回最小稳定格式：`id` / `object` / `created_at` / `model` / `status` / `output` / `output_text`
+
+**Not supported / experimental**
+- `parallel_tool_calls=true` -> 明确返回 `501`
+- 非 function tools -> 明确返回 `400`
+- 完整 Responses API item taxonomy 未全部实现
+- 真正的 Responses streaming 事件格式目前未完整实现，当前以最小兼容为主
+- `metadata` 当前安全忽略
+- `max_output_tokens` 当前仅接收，未精确映射到上游 quota/token 语义
+
+### Tool-calling lifecycle
+
+推荐按以下生命周期使用：
+
+1. 客户端请求模型并附带 `tools`
+2. 服务端根据 schema + 明确信号决定是否返回 tool call
+3. 客户端执行工具
+4. 客户端将 tool output / `function_call_output` 传回服务端
+5. 服务端基于工具结果生成最终回答
+
+当前实现原则：
+- 优先 schema-driven，而不是盲猜
+- 对 path hint 做安全约束
+- 找不到安全 path hint 时，不乱造文件工具调用
+- 参数不满足 schema 时，不静默吞掉
+- `parallel_tool_calls` 尚未支持时明确报错，不假装成功
+
+### Heuristic tool shim
+
+启发式 tool shim 由环境变量控制：
+
+```env
+ENABLE_OPENAI_TOOL_SHIM=1
+```
+
+默认开启。该 shim 主要服务于 coding agent 场景，例如：
+- `read_file`
+- `list_dir`
+- `search_in_files` / `grep_search`
+- `run_command` 中的 `pwd`
+
+它会：
+- 记录 incoming tools 摘要
+- 记录最终决策原因
+- 在生成 tool call 前先校验 required/properties
+- 避免在 inline code blob、路径不明确等情况下瞎调工具
+
+### curl examples
+
+#### 1) 普通 chat completions
 
 ```bash
 curl http://localhost:7860/v1/chat/completions \
@@ -243,12 +327,255 @@ curl http://localhost:7860/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gemini-2.5-flash",
-    "messages": [{"role": "user", "content": "你好"}],
-    "stream": true
+    "messages": [
+      {"role": "user", "content": "你好"}
+    ]
   }'
 ```
 
-> `API_KEY` 在管理面板 → 系统设置中配置，留空则公开访问，支持多个 Key 逗号分隔。
+#### 2) chat completions with tools
+
+```bash
+curl http://localhost:7860/v1/chat/completions \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-auto",
+    "messages": [
+      {"role": "user", "content": "Read `agent.py`"}
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "Read a file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {"type": "string"}
+            },
+            "required": ["path"],
+            "additionalProperties": false
+          }
+        }
+      }
+    ]
+  }'
+```
+
+#### 3) gửi tool result quay lại chat completions
+
+```bash
+curl http://localhost:7860/v1/chat/completions \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-auto",
+    "messages": [
+      {"role": "user", "content": "What is the first line?"},
+      {
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "id": "call_123",
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "arguments": "{\"path\":\"agent.py\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_123",
+        "content": "1 | #!/usr/bin/env python3"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "Read a file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {"type": "string"}
+            },
+            "required": ["path"]
+          }
+        }
+      }
+    ]
+  }'
+```
+
+#### 4) 普通 responses
+
+```bash
+curl http://localhost:7860/v1/responses \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-auto",
+    "input": "Hello"
+  }'
+```
+
+#### 5) responses with tools
+
+```bash
+curl http://localhost:7860/v1/responses \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-auto",
+    "input": "Read `agent.py`",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "Read a file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {"type": "string"}
+            },
+            "required": ["path"],
+            "additionalProperties": false
+          }
+        }
+      }
+    ]
+  }'
+```
+
+#### 6) gửi `function_call_output` quay lại responses
+
+```bash
+curl http://localhost:7860/v1/responses \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-auto",
+    "input": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "input_text", "text": "What is the first line?"}
+        ]
+      },
+      {
+        "type": "function_call_output",
+        "call_id": "call_123",
+        "output": "1 | #!/usr/bin/env python3"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "Read a file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {"type": "string"}
+            },
+            "required": ["path"]
+          }
+        }
+      }
+    ]
+  }'
+```
+
+### Python example with OpenAI SDK
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:7860/v1",
+    api_key="your-api-key",
+)
+
+response = client.chat.completions.create(
+    model="gemini-auto",
+    messages=[
+        {"role": "user", "content": "Read `agent.py`"}
+    ],
+    tools=[
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"}
+                    },
+                    "required": ["path"]
+                }
+            }
+        }
+    ]
+)
+
+print(response)
+```
+
+### Experimental notes
+
+以下能力目前应视为 **experimental**：
+- `/v1/responses`（整体仍是 minimal subset）
+- 启发式 tool-calling shim
+- coding-agent oriented 的 schema fallback
+- 与特定第三方 agent / SDK 的边缘兼容行为
+
+如果某类请求当前无法被干净支持，服务会优先返回明确的 `400` / `501`，而不是静默伪造兼容行为。
+
+Nếu bạn cần “backend tốt cho coding agents”, hãy ưu tiên dựa trên các hành vi đã liệt kê ở đây thay vì giả định toàn bộ OpenAI Responses API đều đã có.
+
+### agent.py
+
+`agent.py` 目前 vẫn dùng được với `/v1/chat/completions` như cũ.
+Nếu muốn thử `/v1/responses` cho workflow riêng, nên giữ `/v1/chat/completions` làm fallback ở client layer thay vì bỏ hẳn route cũ.
+
+Ví dụ chạy agent hiện tại:
+
+```bash
+GEMINI_API_BASE=http://localhost:7860/v1 \
+GEMINI_API_KEY=your-api-key \
+python agent.py
+```
+
+Hoặc chạy one-shot:
+
+```bash
+GEMINI_API_BASE=http://localhost:7860/v1 \
+GEMINI_API_KEY=your-api-key \
+python agent.py "Read agent.py and summarize the first lines"
+```
+
+Nếu sau này sửa `agent.py` để ưu tiên `/v1/responses`, vẫn nên giữ fallback `/v1/chat/completions` khi gặp `400/501` từ responses.
+
+### 测试
+
+本仓库当前新增了最小兼容测试，覆盖：
+- chat completions 无 tools
+- chat completions tool call
+- chat completions tool result -> final answer
+- responses input string
+- responses tools -> function call
+- responses function_call_output -> final answer
+- unsupported request -> clear error
+- invalid schema -> clear error
+- backward compatibility of old route
 
 ---
 
