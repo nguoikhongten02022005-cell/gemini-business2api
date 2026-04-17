@@ -130,6 +130,28 @@ class OpenAICompatTests(unittest.TestCase):
         self.assertEqual(body["choices"][0]["finish_reason"], "stop")
         self.assertEqual(body["choices"][0]["message"]["content"], "#!/usr/bin/env python3")
 
+    def test_chat_completions_with_tool_result_falls_back_to_raw_tool_text(self):
+        response = self.client.post(
+            "/v1/chat/completions",
+            headers=auth_headers(),
+            json={
+                "model": "gemini-auto",
+                "messages": [
+                    {"role": "user", "content": "Summarize the command output"},
+                    {"role": "assistant", "tool_calls": [{
+                        "id": "call_456",
+                        "type": "function",
+                        "function": {"name": "run_command", "arguments": '{"command":"pwd"}'},
+                    }]},
+                    {"role": "tool", "tool_call_id": "call_456", "content": "line one\nline two"},
+                ],
+                "tools": tool_schema("run_command"),
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["choices"][0]["message"]["content"], "line one\nline two")
+
     @patch("main.chat_impl", new_callable=AsyncMock)
     def test_responses_endpoint_with_input_string_returns_success(self, mock_chat_impl):
         mock_chat_impl.return_value = chat_completion_payload("Hello from backend")
@@ -155,6 +177,36 @@ class OpenAICompatTests(unittest.TestCase):
         self.assertEqual(len(chat_req.messages), 1)
         self.assertEqual(chat_req.messages[0].role, "user")
         self.assertEqual(chat_req.messages[0].content, "Hello")
+
+    @patch("main.uptime_tracker.record_request")
+    def test_responses_plain_request_records_api_service_once(self, mock_record_request):
+        response = self.client.post(
+            "/v1/responses",
+            headers=auth_headers(),
+            json={"model": "not-a-real-model", "input": "Hello"},
+        )
+
+        self.assertEqual(response.status_code, 404)
+        api_service_calls = [call for call in mock_record_request.call_args_list if call.args and call.args[0] == "api_service"]
+        self.assertEqual(len(api_service_calls), 1)
+        self.assertFalse(api_service_calls[0].args[1])
+        self.assertEqual(api_service_calls[0].args[3], 404)
+
+    @patch("main.uptime_tracker.record_request")
+    def test_responses_tool_request_still_records_api_service_once_via_middleware(self, mock_record_request):
+        response = self.client.post(
+            "/v1/responses",
+            headers=auth_headers(),
+            json={
+                "model": "gemini-auto",
+                "input": "Read `agent.py`",
+                "tools": tool_schema(),
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        api_service_calls = [call for call in mock_record_request.call_args_list if call.args and call.args[0] == "api_service"]
+        self.assertEqual(len(api_service_calls), 1)
 
     @patch("main.chat_impl", new_callable=AsyncMock)
     def test_responses_plain_array_normalizes_roles_and_returns_non_stream_json(self, mock_chat_impl):

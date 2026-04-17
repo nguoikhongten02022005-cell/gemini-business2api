@@ -712,13 +712,16 @@ async def track_uptime_middleware(request: Request, call_next):
 
     try:
         response = await call_next(request)
+        if getattr(request.state, "skip_api_service_uptime", False):
+            return response
         latency_ms = int((time.time() - start_time) * 1000)
         success = response.status_code < 400
         uptime_tracker.record_request("api_service", success, latency_ms, response.status_code)
         return response
 
     except Exception:
-        uptime_tracker.record_request("api_service", False)
+        if not getattr(request.state, "skip_api_service_uptime", False):
+            uptime_tracker.record_request("api_service", False)
         raise
 
 
@@ -2092,7 +2095,7 @@ async def chat(
     authorization: Optional[str] = Header(None)
 ):
     verify_api_key(API_KEY, authorization)
-    return await chat_impl(req, request, authorization)
+    return await chat_impl(req, request)
 
 
 @app.post("/v1/responses")
@@ -2116,10 +2119,10 @@ async def responses(
     if tool_response is not None:
         return tool_response
 
+    request.state.skip_api_service_uptime = True
     chat_response = await chat_impl(
         ChatRequest(**chat_req.model_dump()),
         request,
-        authorization,
     )
     return responses_payload_from_chat_result(
         chat_response,
@@ -2132,7 +2135,6 @@ async def responses(
 async def chat_impl(
     req: ChatRequest,
     request: Request,
-    authorization: Optional[str]
 ):
     # 生成请求ID（最优先，用于所有日志追踪）
     request_id = str(uuid.uuid4())[:6]
@@ -2632,7 +2634,7 @@ async def generate_images(
 
     try:
         # 调用 chat_impl 获取响应
-        chat_response = await chat_impl(chat_req, request, authorization)
+        chat_response = await chat_impl(chat_req, request)
 
         # 从响应中提取图片
         message_content = chat_response["choices"][0]["message"]["content"]
@@ -2757,7 +2759,7 @@ async def edit_images(
         )
 
         # 调用 chat_impl 获取响应
-        chat_response = await chat_impl(chat_req, request, authorization)
+        chat_response = await chat_impl(chat_req, request)
 
         # 从响应中提取图片（复用 /v1/images/generations 的逻辑）
         message_content = chat_response["choices"][0]["message"]["content"]

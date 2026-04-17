@@ -35,7 +35,7 @@
 
 ## ✨ Features
 
-- ✅ Full OpenAI API compatibility - Seamless integration with existing tools
+- ✅ OpenAI-compatible gateway - Compatible with common clients and workflows, but not a full OpenAI behavior replica
 - ✅ Multi-account load balancing - Round-robin with automatic failover
 - ✅ Automated account management - Auto registration & login, multiple temp email providers, headless browser mode
 - ✅ Streaming output - Real-time responses
@@ -72,7 +72,7 @@
 **Supports ARM64 and AMD64 architectures**
 
 ```bash
-git clone https://github.com/Dreamy-rain/gemini-business2api.git
+git clone https://github.com/nguoikhongten02022005-cell/gemini-business2api.git
 cd gemini-business2api
 cp .env.example .env
 # Edit .env to set ADMIN_KEY
@@ -94,7 +94,7 @@ docker compose pull && docker compose up -d
 
 **Linux / macOS / WSL:**
 ```bash
-git clone https://github.com/Dreamy-rain/gemini-business2api.git
+git clone https://github.com/nguoikhongten02022005-cell/gemini-business2api.git
 cd gemini-business2api
 bash setup.sh
 # Edit .env to set ADMIN_KEY
@@ -106,7 +106,7 @@ pm2 start main.py --name gemini-api --interpreter ./.venv/bin/python3
 
 **Windows:**
 ```cmd
-git clone https://github.com/Dreamy-rain/gemini-business2api.git
+git clone https://github.com/nguoikhongten02022005-cell/gemini-business2api.git
 cd gemini-business2api
 setup.bat
 # Edit .env to set ADMIN_KEY
@@ -124,7 +124,7 @@ To update, simply re-run the same script.
 ### Method 3: Manual Deployment
 
 ```bash
-git clone https://github.com/Dreamy-rain/gemini-business2api.git
+git clone https://github.com/nguoikhongten02022005-cell/gemini-business2api.git
 cd gemini-business2api
 
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -214,7 +214,7 @@ The script auto-detects the environment (PostgreSQL / SQLite) and renames old fi
 
 ## 📡 API Endpoints
 
-Fully OpenAI API compatible. Works with ChatGPT-Next-Web, LobeChat, OpenCat, and other clients.
+This project exposes an OpenAI-compatible gateway. `/v1/chat/completions` is the primary compatibility route, and `/v1/responses` is an experimental minimal subset rather than a full Responses API implementation.
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -346,7 +346,9 @@ In addition to local Docker Compose, these platforms support Docker image deploy
 
 ## 🔄 Standalone Refresh Service
 
-To deploy the account refresh service separately from the main API, use the [`refresh-worker` branch](https://github.com/Dreamy-rain/gemini-business2api/tree/refresh-worker):
+To deploy the account refresh service separately from the main API, use the upstream [`refresh-worker` branch](https://github.com/Dreamy-rain/gemini-business2api/tree/refresh-worker):
+
+> Note: this fork currently publishes `main` only, so branch-specific deployment examples still point to the upstream repository.
 
 ```bash
 git clone -b refresh-worker https://github.com/Dreamy-rain/gemini-business2api.git gemini-refresh-worker
@@ -376,6 +378,8 @@ Recommended setup:
 - Use `clash-proxy` when your network path relies on Clash proxy routing
 
 ### Clash Proxy Deployment Example
+
+> Note: `clash-proxy` is also an upstream-only branch at the moment, so this example keeps the upstream repository URL.
 
 ```bash
 git clone -b clash-proxy https://github.com/Dreamy-rain/gemini-business2api.git gemini-business2api-clash

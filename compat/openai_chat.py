@@ -82,6 +82,12 @@ def last_tool_message(messages: List[Any]) -> Optional[Any]:
 
 
 def final_response_from_tool_result(req: Any) -> Optional[str]:
+    """Apply a minimal local finalization shim for simple tool-result turns.
+
+    This does not call the upstream model for another reasoning step. It only
+    converts the latest tool output into a final assistant message for a small
+    set of predictable patterns.
+    """
     tool_message = last_tool_message(req.messages)
     if tool_message is None:
         return None
