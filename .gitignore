@@ -48,3 +48,4 @@ static/
 .DS_Store
 Thumbs.db
 old_version.py
+*router-backup-*.json
