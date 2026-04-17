@@ -1,5 +1,6 @@
 import os
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -33,6 +34,21 @@ def tool_schema(name="read_file"):
     }]
 
 
+def chat_completion_payload(content="Hello from backend", model="gemini-auto"):
+    return {
+        "id": "chatcmpl_test",
+        "object": "chat.completion",
+        "created": 1_700_000_000,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+
 class OpenAICompatTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -42,6 +58,25 @@ class OpenAICompatTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.client_cm.__exit__(None, None, None)
+
+    @patch("main.chat_impl", new_callable=AsyncMock)
+    def test_chat_completions_simple_without_tools_can_return_success(self, mock_chat_impl):
+        mock_chat_impl.return_value = chat_completion_payload("Hello from backend")
+
+        response = self.client.post(
+            "/v1/chat/completions",
+            headers=auth_headers(),
+            json={
+                "model": "gemini-auto",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["object"], "chat.completion")
+        self.assertEqual(body["choices"][0]["message"]["content"], "Hello from backend")
+        mock_chat_impl.assert_awaited_once()
 
     def test_chat_completions_simple_without_tools_reaches_gateway_logic(self):
         response = self.client.post(
@@ -95,14 +130,70 @@ class OpenAICompatTests(unittest.TestCase):
         self.assertEqual(body["choices"][0]["finish_reason"], "stop")
         self.assertEqual(body["choices"][0]["message"]["content"], "#!/usr/bin/env python3")
 
-    def test_responses_endpoint_with_input_string(self):
+    @patch("main.chat_impl", new_callable=AsyncMock)
+    def test_responses_endpoint_with_input_string_returns_success(self, mock_chat_impl):
+        mock_chat_impl.return_value = chat_completion_payload("Hello from backend")
+
         response = self.client.post(
             "/v1/responses",
             headers=auth_headers(),
             json={"model": "gemini-auto", "input": "Hello"},
         )
-        self.assertEqual(response.status_code, 501)
-        self.assertEqual(response.json()["detail"]["type"], "not_supported_error")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["object"], "response")
+        self.assertEqual(body["output_text"], "Hello from backend")
+        self.assertEqual(body["output"][0]["type"], "message")
+        self.assertEqual(body["output"][0]["content"][0]["type"], "output_text")
+        self.assertEqual(body["output"][0]["content"][0]["text"], "Hello from backend")
+
+        mock_chat_impl.assert_awaited_once()
+        chat_req = mock_chat_impl.await_args.args[0]
+        self.assertEqual(chat_req.model, "gemini-auto")
+        self.assertFalse(chat_req.stream)
+        self.assertEqual(len(chat_req.messages), 1)
+        self.assertEqual(chat_req.messages[0].role, "user")
+        self.assertEqual(chat_req.messages[0].content, "Hello")
+
+    @patch("main.chat_impl", new_callable=AsyncMock)
+    def test_responses_plain_array_normalizes_roles_and_returns_non_stream_json(self, mock_chat_impl):
+        mock_chat_impl.return_value = chat_completion_payload("Structured reply")
+
+        response = self.client.post(
+            "/v1/responses",
+            headers=auth_headers(),
+            json={
+                "model": "gemini-auto",
+                "instructions": "Follow the spec",
+                "stream": True,
+                "input": [
+                    {"role": "developer", "content": [{"type": "input_text", "text": "Developer note"}]},
+                    {"role": "system", "content": [{"type": "input_text", "text": "System note"}]},
+                    {"role": "assistant", "content": [{"type": "output_text", "text": "Previous answer"}]},
+                    {"role": "user", "content": [{"type": "input_text", "text": "Hello"}]},
+                ],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("application/json", response.headers["content-type"])
+        body = response.json()
+        self.assertEqual(body["output_text"], "Structured reply")
+
+        mock_chat_impl.assert_awaited_once()
+        chat_req = mock_chat_impl.await_args.args[0]
+        self.assertFalse(chat_req.stream)
+        self.assertEqual(
+            [(message.role, message.content) for message in chat_req.messages],
+            [
+                ("system", "Follow the spec"),
+                ("system", "Developer note"),
+                ("system", "System note"),
+                ("assistant", "Previous answer"),
+                ("user", "Hello"),
+            ],
+        )
 
     def test_responses_with_tools_returns_function_call(self):
         response = self.client.post(
@@ -169,6 +260,26 @@ class OpenAICompatTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["detail"]["type"], "invalid_request_error")
+
+    def test_responses_rejects_unsupported_input_content_type(self):
+        response = self.client.post(
+            "/v1/responses",
+            headers=auth_headers(),
+            json={
+                "model": "gemini-auto",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_image", "image_url": "https://example.com/x.png"}
+                        ],
+                    }
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"]["type"], "invalid_request_error")
+        self.assertIn("Unsupported", response.json()["detail"]["message"])
 
     def test_backward_compatibility_old_route_still_works_for_tool_shim(self):
         response = self.client.post(

@@ -4,7 +4,6 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fastapi import HTTPException
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from compat.openai_chat import maybe_handle_openai_tool_request
@@ -53,23 +52,82 @@ class ChatRequestCompat(BaseModel):
     parallel_tool_calls: Optional[bool] = None
 
 
-def _flatten_content(content: Any) -> str:
+SUPPORTED_TEXT_ITEM_TYPES = {"input_text", "output_text", "text"}
+SUPPORTED_MESSAGE_ROLES = {"user", "assistant", "system", "developer"}
+
+
+def build_error_payload(message: str, error_type: str = "invalid_request_error", status_code: int = 400) -> None:
+    raise HTTPException(status_code=status_code, detail={"message": message, "type": error_type})
+
+
+def _flatten_text_content(content: Any, field_name: str) -> str:
     if isinstance(content, str):
         return content
+
     if isinstance(content, list):
         parts: List[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                item_type = item.get("type")
-                if item_type in {"input_text", "output_text", "text"} and isinstance(item.get("text"), str):
-                    parts.append(item["text"])
-                elif item_type == "text" and isinstance(item.get("content"), str):
-                    parts.append(item["content"])
+        for index, item in enumerate(content):
+            if not isinstance(item, dict):
+                build_error_payload(f"{field_name}[{index}] must be an object")
+            item_type = item.get("type")
+            if item_type not in SUPPORTED_TEXT_ITEM_TYPES:
+                build_error_payload(f"Unsupported {field_name}[{index}].type: {item_type!r}")
+            text = item.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+                continue
+            if item_type == "text" and isinstance(item.get("content"), str):
+                parts.append(item["content"])
+                continue
+            build_error_payload(f"{field_name}[{index}] requires a text string")
         return "\n".join(parts)
+
     if isinstance(content, dict):
-        if isinstance(content.get("text"), str):
-            return content["text"]
-    return ""
+        item_type = content.get("type")
+        if item_type is not None and item_type not in SUPPORTED_TEXT_ITEM_TYPES:
+            build_error_payload(f"Unsupported {field_name}.type: {item_type!r}")
+        text = content.get("text")
+        if isinstance(text, str):
+            return text
+        if item_type == "text" and isinstance(content.get("content"), str):
+            return content["content"]
+        build_error_payload(f"{field_name} requires a text string")
+
+    if content is None:
+        build_error_payload(f"{field_name} is required")
+
+    build_error_payload(f"{field_name} must be a string or text item list")
+
+
+def _coerce_tool_output_text(output: Any) -> str:
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        return output
+    if isinstance(output, (int, float, bool)):
+        return json.dumps(output, ensure_ascii=False)
+    if isinstance(output, (list, dict)):
+        try:
+            return _flatten_text_content(output, "function_call_output.output")
+        except HTTPException:
+            return json.dumps(output, ensure_ascii=False)
+    return str(output)
+
+
+def validate_responses_request(req: ResponsesRequest) -> None:
+    if req.parallel_tool_calls:
+        build_error_payload("parallel_tool_calls is not supported yet", "not_supported_error", 501)
+
+    if req.tool_choice not in (None, "auto", "required", "none") and not isinstance(req.tool_choice, dict):
+        build_error_payload("Unsupported tool_choice value", "invalid_request_error", 400)
+
+    if req.tools:
+        for tool in req.tools:
+            if tool.get("type") != "function":
+                build_error_payload("Only function tools are supported", "invalid_request_error", 400)
+            parameters = (tool.get("function") or {}).get("parameters")
+            if parameters is not None and not isinstance(parameters, dict):
+                build_error_payload("Tool parameters must be a JSON schema object", "invalid_request_error", 400)
 
 
 def normalize_responses_input(input_value: Union[str, List[Dict[str, Any]], List[ResponsesInputItem]], instructions: Optional[str]) -> List[ChatMessage]:
@@ -85,21 +143,43 @@ def normalize_responses_input(input_value: Union[str, List[Dict[str, Any]], List
         item = raw_item if isinstance(raw_item, ResponsesInputItem) else ResponsesInputItem.model_validate(raw_item)
         if item.type == "function_call_output":
             if not item.call_id:
-                raise HTTPException(status_code=400, detail="function_call_output items require call_id")
-            output_text = _flatten_content(item.output)
-            messages.append(ChatMessage(role="tool", tool_call_id=item.call_id, content=output_text))
+                build_error_payload("function_call_output items require call_id")
+            messages.append(
+                ChatMessage(
+                    role="tool",
+                    tool_call_id=item.call_id,
+                    content=_coerce_tool_output_text(item.output),
+                )
+            )
             continue
 
         role = item.role
-        if role in {"user", "assistant", "system", "developer"}:
+        if role in SUPPORTED_MESSAGE_ROLES:
             mapped_role = "system" if role == "developer" else role
-            text = item.text if isinstance(item.text, str) else _flatten_content(item.content)
+            if isinstance(item.text, str):
+                text = item.text
+            else:
+                text = _flatten_text_content(item.content, f"input[{len(messages)}].content")
             messages.append(ChatMessage(role=mapped_role, content=text))
             continue
 
-        raise HTTPException(status_code=400, detail=f"Unsupported responses input item: role={role!r} type={item.type!r}")
+        build_error_payload(f"Unsupported responses input item: role={role!r} type={item.type!r}")
 
     return messages
+
+
+def chat_request_from_responses(req: ResponsesRequest) -> ChatRequestCompat:
+    validate_responses_request(req)
+    return ChatRequestCompat(
+        model=req.model,
+        messages=normalize_responses_input(req.input, req.instructions),
+        stream=False,
+        temperature=req.temperature,
+        top_p=req.top_p,
+        tools=req.tools,
+        tool_choice=req.tool_choice,
+        parallel_tool_calls=req.parallel_tool_calls,
+    )
 
 
 def responses_output_from_chat_message(message: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str]:
@@ -142,52 +222,25 @@ def build_responses_payload(response_id: str, model: str, created_at: int, outpu
     }
 
 
-def build_error_payload(message: str, error_type: str = "invalid_request_error", status_code: int = 400) -> HTTPException:
-    raise HTTPException(status_code=status_code, detail={"message": message, "type": error_type})
+def responses_payload_from_chat_result(chat_result: Dict[str, Any], response_id: str, requested_model: Optional[str] = None, created_at: Optional[int] = None) -> Dict[str, Any]:
+    message = chat_result["choices"][0]["message"]
+    output, output_text = responses_output_from_chat_message(message)
+    resolved_model = chat_result.get("model") or requested_model or "unknown"
+    resolved_created_at = chat_result.get("created") or created_at or int(time.time())
+    return build_responses_payload(response_id, resolved_model, resolved_created_at, output, output_text)
 
 
-def maybe_handle_responses_request(req: ResponsesRequest):
-    if req.parallel_tool_calls:
-        build_error_payload("parallel_tool_calls is not supported yet", "not_supported_error", 501)
-
-    if req.tool_choice not in (None, "auto", "required", "none") and not isinstance(req.tool_choice, dict):
-        build_error_payload("Unsupported tool_choice value", "invalid_request_error", 400)
-
-    if req.tools:
-        for tool in req.tools:
-            if tool.get("type") != "function":
-                build_error_payload("Only function tools are supported", "invalid_request_error", 400)
-            parameters = (tool.get("function") or {}).get("parameters")
-            if parameters is not None and not isinstance(parameters, dict):
-                build_error_payload("Tool parameters must be a JSON schema object", "invalid_request_error", 400)
-
-    messages = normalize_responses_input(req.input, req.instructions)
-    chat_req = ChatRequestCompat(
-        model=req.model,
-        messages=messages,
-        stream=req.stream,
-        temperature=req.temperature,
-        top_p=req.top_p,
-        tools=req.tools,
-        tool_choice=req.tool_choice,
-        parallel_tool_calls=req.parallel_tool_calls,
-    )
-    response_id = f"resp_{uuid.uuid4().hex}"
-    created_at = int(time.time())
+def maybe_handle_responses_request(
+    req: ResponsesRequest,
+    chat_req: Optional[ChatRequestCompat] = None,
+    response_id: Optional[str] = None,
+    created_at: Optional[int] = None,
+):
+    chat_req = chat_req or chat_request_from_responses(req)
+    response_id = response_id or f"resp_{uuid.uuid4().hex}"
+    created_at = created_at or int(time.time())
     chat_id = f"chatcmpl-{uuid.uuid4()}"
     chat_result = maybe_handle_openai_tool_request(chat_req, chat_id, created_at)
     if chat_result is None:
         return None
-
-    if isinstance(chat_result, StreamingResponse):
-        async def generator():
-            async for chunk in chat_result.body_iterator:
-                if isinstance(chunk, bytes):
-                    yield chunk
-                else:
-                    yield chunk.encode("utf-8")
-        return StreamingResponse(generator(), media_type="text/event-stream")
-
-    message = chat_result["choices"][0]["message"]
-    output, output_text = responses_output_from_chat_message(message)
-    return build_responses_payload(response_id, req.model, created_at, output, output_text)
+    return responses_payload_from_chat_result(chat_result, response_id, requested_model=req.model, created_at=created_at)

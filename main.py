@@ -44,7 +44,12 @@ from core.message import (
     build_full_context_text
 )
 from compat.openai_chat import create_chunk, maybe_handle_openai_tool_request
-from compat.openai_responses import ResponsesRequest, maybe_handle_responses_request
+from compat.openai_responses import (
+    ResponsesRequest,
+    chat_request_from_responses,
+    maybe_handle_responses_request,
+    responses_payload_from_chat_result,
+)
 from core.google_api import (
     get_common_headers,
     create_google_session,
@@ -1314,21 +1319,6 @@ class ImageGenerationRequest(BaseModel):
     quality: Optional[str] = "standard"  # "standard" or "hd"
     style: Optional[str] = "natural"  # "natural" or "vivid"
 
-def create_chunk(id: str, created: int, model: str, delta: dict, finish_reason: Union[str, None]) -> str:
-    chunk = {
-        "id": id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "delta": delta,
-            "logprobs": None,  # OpenAI 标准字段
-            "finish_reason": finish_reason
-        }],
-        "system_fingerprint": None  # OpenAI 标准字段（可选）
-    }
-    return json.dumps(chunk)
 # ---------- Auth endpoints (API) ----------
 
 @app.post("/login")
@@ -2108,20 +2098,34 @@ async def chat(
 @app.post("/v1/responses")
 async def responses(
     req: ResponsesRequest,
+    request: Request,
     authorization: Optional[str] = Header(None)
 ):
     verify_api_key(API_KEY, authorization)
-    response = maybe_handle_responses_request(req)
-    if response is not None:
-        return response
-    if req.parallel_tool_calls:
-        raise HTTPException(status_code=501, detail={"message": "parallel_tool_calls is not supported yet", "type": "not_supported_error"})
-    raise HTTPException(
-        status_code=501,
-        detail={
-            "message": "This gateway only implements a minimal /v1/responses subset for tool-calling workflows.",
-            "type": "not_supported_error",
-        },
+
+    response_id = f"resp_{uuid.uuid4().hex}"
+    created_at = int(time.time())
+    chat_req = chat_request_from_responses(req)
+
+    tool_response = maybe_handle_responses_request(
+        req,
+        chat_req=chat_req,
+        response_id=response_id,
+        created_at=created_at,
+    )
+    if tool_response is not None:
+        return tool_response
+
+    chat_response = await chat_impl(
+        ChatRequest(**chat_req.model_dump()),
+        request,
+        authorization,
+    )
+    return responses_payload_from_chat_result(
+        chat_response,
+        response_id=response_id,
+        requested_model=req.model,
+        created_at=created_at,
     )
 
 # chat实现函数
